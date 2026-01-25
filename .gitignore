@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data (Crucial: Do NOT upload MSTAR data)
+data/
+outputs/checkpoints/
+outputs/results/*.npy
+outputs/results/*.csv
+
+# System
+.DS_Store
+Thumbs.db
