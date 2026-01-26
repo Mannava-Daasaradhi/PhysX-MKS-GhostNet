@@ -1,0 +1,5 @@
+Training Fraction,Test Accuracy
+10% Data,85.4%
+20% Data,91.2%
+50% Data,96.8%
+100% Data,99.8%

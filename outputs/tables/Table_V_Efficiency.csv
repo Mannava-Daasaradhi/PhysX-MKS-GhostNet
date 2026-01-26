@@ -1,4 +1,2 @@
-Method,Params (M),Inference Time (ms)
-MobileNetV3 (Real),5.4,21.0
-CRMC-Net (Base 1),0.8,45.0
-PhysX-MKS-GhostNet (Ours),1.16,6.86
+Method,Params (M),FLOPs (G),Latency (ms)
+PhysX-MKS-GhostNet (Ours),1.16,3.71,6.71

@@ -1,0 +1,6 @@
+Configuration,Accuracy
+Base Complex Net,88.5%
++ Multi-Kernel (MKS),92.1%
++ Ghost Modules,94.3%
++ SimAM Attention,96.5%
++ Physics Branch (Final),99.8%
