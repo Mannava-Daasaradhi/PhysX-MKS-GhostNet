@@ -6,8 +6,7 @@ __pycache__/
 # Data (Crucial: Do NOT upload MSTAR data)
 data/
 outputs/checkpoints/
-outputs/results/*.npy
-outputs/results/*.csv
+
 
 # System
 .DS_Store

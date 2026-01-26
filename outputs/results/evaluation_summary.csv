@@ -1,0 +1,4 @@
+Test_Set,Condition,Accuracy (%)
+SoC-10,Standard (15 deg),99.53168904152358
+EoC-1,Depression Angle (30/45 deg),79.39876215738285
+EoC-2,"Version Variants (BMP2-C21, T72-A32...)",84.89900609169607

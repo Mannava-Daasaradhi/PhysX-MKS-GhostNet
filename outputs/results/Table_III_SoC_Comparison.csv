@@ -1,0 +1,6 @@
+Method,Backbone,Physics-Informed,Accuracy (%)
+A-ConvNets,CNN (Real),No,99.13
+CV-ResNet,ResNet (Complex),No,99.54
+KINN (Base 2),GNN + Scattering,Yes,98.2
+CRMC-Net (Base 1),Ghost-CVNN,No,99.4
+PhysX-MKS-GhostNet (Ours),PhysX-Ghost,Yes,99.53168904152358
