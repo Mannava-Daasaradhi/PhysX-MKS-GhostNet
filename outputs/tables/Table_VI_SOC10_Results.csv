@@ -1,0 +1,8 @@
+Model,Type,Loss,Accuracy (%)
+Traditional CNN,Real,0.3546,96.25
+VGG16,Real,0.0866,97.65
+ResNet18,Real,0.1469,96.82
+CVCNN,Complex,0.0655,98.59
+CV-Net,Complex,0.0225,99.67
+CRMC-Net (SOTA),Complex,0.0114,99.83
+PhysX-MKS-Ghost (Ours),PhysX,0.1569,99.72

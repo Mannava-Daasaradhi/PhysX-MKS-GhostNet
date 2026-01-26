@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from src.models.net_architecture import PhysX_MKS_GhostNet
 from src.dataset import MSTAR_Dataset
+from src.losses import PhysXLoss 
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -16,251 +17,252 @@ CHECKPOINT = "outputs/checkpoints/best_model.pth"
 TABLES_DIR = "outputs/tables"
 RESULTS_DIR = "outputs/results"
 
-def count_parameters(model):
-    """
-    Counts total learnable parameters (Weights + Biases).
-    """
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def count_flops(model, input_shape=(1, 1, 128, 128)):
-    """
-    Calculates FLOPs using Forward Hooks.
-    This is critical for Complex-Valued Networks because a single 'ComplexConv2d'
-    actually performs 4 internal 'nn.Conv2d' operations (ac, bd, ad, bc).
-    
-    Standard tools (like thop) often miscalculate this.
-    Our hook attaches to the underlying nn.Conv2d layers, catching every single
-    execution, ensuring the count is 100% accurate.
-    """
+# --- HELPER: FLOP & PARAM COUNTER ---
+def count_flops_params(model, input_shape=(1, 1, 128, 128)):
     flops = 0
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     def conv_hook(module, input, output):
         nonlocal flops
-        # Output shape: [Batch, Channels, Height, Width]
         batch_size, _, h_out, w_out = output.shape
         c_in = module.in_channels
         c_out = module.out_channels
         k_h, k_w = module.kernel_size
-        
-        # Standard Conv FLOPs formula:
-        # Ops = 2 (Mult+Add) * Cin * K * K * Hout * Wout * Cout
-        # We assume groups=1 for simplicity in basic FLOP counting
         groups = module.groups
-        
-        layer_flops = 2 * c_in * k_h * k_w * h_out * w_out * (c_out // groups) * batch_size
-        
-        if module.bias is not None:
-            layer_flops += h_out * w_out * c_out * batch_size
-            
+        layer_flops = 4 * c_in * k_h * k_w * h_out * w_out * (c_out // groups) * batch_size
+        if module.bias is not None: layer_flops += h_out * w_out * c_out * batch_size
         flops += layer_flops
 
     def linear_hook(module, input, output):
         nonlocal flops
         batch_size = input[0].shape[0]
-        # Linear FLOPs = 2 * Cin * Cout
-        layer_flops = 2 * module.in_features * module.out_features * batch_size
-        if module.bias is not None:
-            layer_flops += module.out_features * batch_size
+        layer_flops = 4 * module.in_features * module.out_features * batch_size
         flops += layer_flops
 
-    # Register hooks on all leaf modules
     hooks = []
     for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            hooks.append(m.register_forward_hook(conv_hook))
-        elif isinstance(m, nn.Linear):
-            hooks.append(m.register_forward_hook(linear_hook))
-            
-    # Run Dummy Forward Pass
-    dummy_input = torch.randn(*input_shape, dtype=torch.complex64).to(DEVICE)
+        if isinstance(m, nn.Conv2d): hooks.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, nn.Linear): hooks.append(m.register_forward_hook(linear_hook))
+    
+    dummy = torch.randn(*input_shape, dtype=torch.complex64).to(DEVICE)
     model.eval()
-    with torch.no_grad():
-        _ = model(dummy_input)
-        
-    # Remove hooks to clean up
+    with torch.no_grad(): _ = model(dummy)
     for h in hooks: h.remove()
     
-    return flops
+    return params / 1e6, flops / 1e9
 
-def calculate_psnr(img1, img2):
-    # img1, img2: [B, C, H, W] Complex Tensors
-    mse = torch.mean((img1.real - img2.real)**2 + (img1.imag - img2.imag)**2)
-    if mse == 0:
-        return 100
-    max_pixel = 1.0
-    psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
-    return psnr.item()
-
-def generate_table_v_efficiency(model):
+# --- HELPER: METRICS & LATEX ---
+def get_metrics(model, split_name, filter_classes=None):
     """
-    Table V: Efficiency Analysis
-    Calculates Params, FLOPs, and Inference Time correctly.
+    Runs inference. If filter_classes is list of ints (e.g. [1,4,7]), 
+    only calculates acc on those classes (for SOC-3).
     """
-    print("Generating Table V: Efficiency Analysis...")
+    print(f"  -> Evaluating {split_name} {'(Filtered)' if filter_classes else ''}...")
+    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split=split_name, cache_memory=True)
+    if len(ds) == 0: return 0.0, 0.0
     
-    # 1. Parameters (Millions)
-    params = count_parameters(model)
-    params_m = params / 1e6
-    print(f"  - Parameters: {params_m:.2f} M")
+    loader = DataLoader(ds, batch_size=32, shuffle=False)
+    criterion = PhysXLoss()
+    criterion.ce_loss = nn.CrossEntropyLoss()
     
-    # 2. FLOPs (Giga)
-    flops = count_flops(model)
-    flops_g = flops / 1e9
-    print(f"  - FLOPs: {flops_g:.2f} G")
-    
-    # 3. Inference Time (Latency)
     model.eval()
-    dummy_input = torch.randn(1, 1, 128, 128, dtype=torch.complex64).to(DEVICE)
-    
-    # Warmup (Essential for GPU to reach clock speeds)
-    print("  - Warming up GPU...")
-    for _ in range(50): 
-        _ = model(dummy_input)
-    
-    # Measure Latency with Sync
-    print("  - Measuring Latency...")
-    iters = 300
-    
-    # Synchronize before start
-    if DEVICE.type == 'cuda': torch.cuda.synchronize()
-    start = time.time()
+    total_loss, correct, total = 0, 0, 0
     
     with torch.no_grad():
-        for _ in range(iters):
-            _ = model(dummy_input)
+        for img, label in loader:
+            img, label = img.to(DEVICE), label.to(DEVICE)
+            logits, recon, scatter, _ = model(img)
             
-    # Synchronize after end
-    if DEVICE.type == 'cuda': torch.cuda.synchronize()
-    end = time.time()
+            # Loss is always calculated on batch (approx)
+            loss = criterion(logits, recon, scatter, label, img)
+            total_loss += loss.item()
+            
+            _, preds = torch.max(logits, 1)
+            
+            # Filter Logic for SOC-3
+            if filter_classes is not None:
+                # specific MSTAR classes: BMP2(1), BTR70(4), T72(7)
+                mask = torch.isin(label, torch.tensor(filter_classes).to(DEVICE))
+                if mask.sum() > 0:
+                    correct += (preds[mask] == label[mask]).sum().item()
+                    total += mask.sum().item()
+            else:
+                correct += (preds == label).sum().item()
+                total += label.size(0)
+            
+    # Avoid div by zero if filter found nothing
+    if total == 0: return 0.0, 0.0
     
-    avg_time_ms = ((end - start) / iters) * 1000
-    
-    # 4. Save Data
-    # Only saving OUR model's data. Fill in comparisons manually from papers if needed.
-    data = [
-        ["PhysX-MKS-GhostNet (Ours)", f"{params_m:.2f}", f"{flops_g:.2f}", f"{avg_time_ms:.2f}"]
-    ]
-    
-    df = pd.DataFrame(data, columns=["Method", "Params (M)", "FLOPs (G)", "Latency (ms)"])
-    print("\n--- Efficiency Results ---")
-    print(df)
-    df.to_csv(f"{TABLES_DIR}/Table_V_Efficiency.csv", index=False)
+    return total_loss / len(loader), 100 * correct / total
+
+def save_table(df, filename):
+    csv_path = f"{TABLES_DIR}/{filename}.csv"
+    tex_path = f"{TABLES_DIR}/{filename}.tex"
+    df.to_csv(csv_path, index=False)
+    latex_code = df.to_latex(index=False, bold_rows=True, caption=filename.replace("_", " "))
+    with open(tex_path, "w") as f:
+        f.write(latex_code)
+    print(f"  -> Saved {filename} (.csv & .tex)")
+
+# --- TABLE GENERATORS ---
 
 def generate_table_i_network_config(model):
-    """ Table I: Network Parameter Configuration """
-    print("Generating Table I...")
-    data = []
-    
-    # CMKS (Module A)
-    data.append(["CMKS_Branch1", "3x3", 1, "1x16x128x128"])
-    data.append(["CMKS_Branch2", "5x5", 1, "1x16x128x128"])
-    data.append(["CMKS_Branch3", "7x7", 1, "1x16x128x128"])
-    data.append(["Fusion", "Concat", "-", "48x128x128"])
-    
-    # Ghost Backbone (Module B)
+    print("Generating Table I (Network Config)...")
+    data = [
+        ["CMKS_Branch1", "3x3", 1, "1x10x128x128"],
+        ["CMKS_Branch2", "5x5", 1, "1x10x128x128"],
+        ["CMKS_Branch3", "7x7", 1, "1x10x128x128"],
+        ["Fusion", "Concat", "-", "30x128x128"]
+    ]
     for i, cfg in enumerate(model.cfgs):
-        k, exp, c, se, s = cfg
-        layer_name = f"Ghost_Stage_{i+1}"
-        data.append([layer_name, f"Ghost({k}x{k})", s, f"{c} channels"])
-
-    # Heads
+        k, _, c, _, s = cfg
+        data.append([f"Ghost_Stage_{i+1}", f"Ghost({k}x{k})", s, f"{int(c*0.7)} channels"])
     data.append(["Physics_Branch", "Energy", "-", "1x128x128"])
-    data.append(["Reconstruction", "Upsample", "-", "1x128x128"])
     data.append(["Classifier", "Linear", "-", "10 Classes"])
-    
     df = pd.DataFrame(data, columns=["Layer", "Kernel/Type", "Stride", "Output Dims"])
-    df.to_csv(f"{TABLES_DIR}/Table_I_Network_Config.csv", index=False)
+    save_table(df, "Table_I_Network_Config")
 
-def generate_table_ii_dataset_config():
-    """ Table II: Dataset Configuration """
-    print("Generating Table II...")
-    splits = ['soc_train', 'soc_test', 'eoc_1_test', 'eoc_2_test']
-    data = []
-    
-    for split in splits:
-        ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split=split, cache_memory=False)
-        count = len(ds)
-        desc = "Standard" if "soc" in split else "Robustness Test"
-        data.append([split.upper(), desc, count])
-        
-    df = pd.DataFrame(data, columns=["Dataset Split", "Description", "Image Count"])
-    df.to_csv(f"{TABLES_DIR}/Table_II_Dataset_Config.csv", index=False)
+def generate_table_iii_soc10_config():
+    print("Generating Table III (SOC-10 Dataset Config)...")
+    # Data from Paper Table III
+    data = [
+        ["1-2S1", "B01", 299, 274],
+        ["2-BMP2", "SN9563", 233, 195],
+        ["3-BRDM2", "E-71", 298, 274],
+        ["4-BTR-60", "K10yt7532", 256, 195],
+        ["5-BTR-70", "C71", 233, 196],
+        ["6-D7", "92v13015", 299, 274],
+        ["7-T62", "A51", 299, 273],
+        ["8-T72", "SN132", 232, 196],
+        ["9-ZIL131", "E12", 299, 274],
+        ["10-ZSU234", "D08", 299, 274],
+        ["Total", "-", 2747, 2425]
+    ]
+    df = pd.DataFrame(data, columns=["Class", "Serial No.", "Training (17 deg)", "Testing (15 deg)"])
+    save_table(df, "Table_III_SOC10_Config")
 
-def generate_table_iii_soc_comparison():
-    """ Table III: SoC-10 SOTA Comparison """
-    print("Generating Table III...")
+def generate_table_iv_soc3_config():
+    print("Generating Table IV (SOC-3 Dataset Config)...")
+    # Data from Paper Table IV
+    data = [
+        ["2-BMP2", "SN9563", 233, 195],
+        ["5-BTR-70", "C71", 233, 196],
+        ["8-T72", "SN132", 232, 196],
+        ["Total", "-", 698, 587]
+    ]
+    df = pd.DataFrame(data, columns=["Class", "Serial No.", "Training (17 deg)", "Testing (15 deg)"])
+    save_table(df, "Table_IV_SOC3_Config")
+
+def generate_table_v_eoc_config():
+    print("Generating Table V (EOC-VV-4 Dataset Config)...")
+    # Data from Paper Table V
+    data = [
+        ["Train", "2-BMP2", "SN9563", 233],
+        ["Train", "8-T72", "SN132", 232],
+        ["Test", "2-BMP2", "SN9566", 196],
+        ["Test", "2-BMP2", "C21", 196],
+        ["Test", "8-T72", "SN812", 195],
+        ["Test", "8-T72", "S7", 191]
+    ]
+    df = pd.DataFrame(data, columns=["Set", "Class", "Serial No.", "Count"])
+    save_table(df, "Table_V_EOC_Config")
+
+def generate_table_vi_soc10_results(model):
+    print("Generating Table VI (SOC-10 Results)...")
+    loss, acc = get_metrics(model, 'soc_test')
+    data = [
+        ["Traditional CNN", "Real", 0.3546, 96.25],
+        ["VGG16", "Real", 0.0866, 97.65],
+        ["ResNet18", "Real", 0.1469, 96.82],
+        ["CVCNN", "Complex", 0.0655, 98.59],
+        ["CV-Net", "Complex", 0.0225, 99.67],
+        ["CRMC-Net (SOTA)", "Complex", 0.0114, 99.83],
+        ["PhysX-MKS-Ghost (Ours)", "PhysX", f"{loss:.4f}", f"{acc:.2f}"]
+    ]
+    df = pd.DataFrame(data, columns=["Model", "Type", "Loss", "Accuracy (%)"])
+    save_table(df, "Table_VI_SOC10_Results")
+
+def generate_table_vii_soc3_results(model):
+    print("Generating Table VII (SOC-3 Results)...")
+    # SOC-3 uses only classes BMP2(1), BTR70(4), T72(7)
+    # We filter the full SOC test set for these indices
+    loss, acc = get_metrics(model, 'soc_test', filter_classes=[1, 4, 7])
     
-    try:
-        eval_df = pd.read_csv(f"{RESULTS_DIR}/evaluation_summary.csv")
-        our_acc = eval_df.loc[eval_df['Test_Set'] == 'SoC-10', 'Accuracy (%)'].values[0]
-    except:
-        our_acc = "N/A"
+    data = [
+        ["Traditional CNN", "Real", 0.0273, 99.41],
+        ["VGG16", "Real", 0.0315, 98.97],
+        ["ResNet18", "Real", 0.0358, 99.05],
+        ["CVCNN", "Complex", 0.0329, 99.26],
+        ["CV-Net", "Complex", 0.0076, 99.83],
+        ["CRMC-Net (SOTA)", "Complex", 0.0029, 100.00],
+        ["PhysX-MKS-Ghost (Ours)", "PhysX", f"{loss:.4f}", f"{acc:.2f}"]
+    ]
+    df = pd.DataFrame(data, columns=["Model", "Type", "Loss", "Accuracy (%)"])
+    save_table(df, "Table_VII_SOC3_Results")
+
+def generate_table_viii_eoc_results(model):
+    print("Generating Table VIII (EOC-VV-4 Results)...")
+    loss, acc = get_metrics(model, 'eoc_2_test')
+    data = [
+        ["Traditional CNN", "Real", 0.3316, 91.33],
+        ["VGG16", "Real", 0.3849, 88.68],
+        ["ResNet18", "Real", 0.5477, 89.97],
+        ["CVCNN", "Complex", 0.2451, 93.09],
+        ["CV-Net", "Complex", 0.1727, 94.86],
+        ["CRMC-Net (SOTA)", "Complex", 0.1383, 95.02],
+        ["PhysX-MKS-Ghost (Ours)", "PhysX", f"{loss:.4f}", f"{acc:.2f}"]
+    ]
+    df = pd.DataFrame(data, columns=["Model", "Type", "Loss", "Accuracy (%)"])
+    save_table(df, "Table_VIII_EOC_Results")
+
+def generate_table_xi_efficiency(model):
+    print("Generating Table XI (Efficiency)...")
+    params_m, flops_g = count_flops_params(model)
+    params_mb = params_m * 8.0 
+    
+    # Latency
+    model.eval()
+    dummy = torch.randn(1, 1, 128, 128, dtype=torch.complex64).to(DEVICE)
+    if DEVICE.type == 'cuda': torch.cuda.synchronize()
+    start = time.time()
+    for _ in range(200): _ = model(dummy)
+    if DEVICE.type == 'cuda': torch.cuda.synchronize()
+    lat = ((time.time() - start) / 200) * 1000
 
     data = [
-        ["A-ConvNets", "CNN (Real)", "No", 99.13],
-        ["CV-ResNet", "ResNet (Complex)", "No", 99.54],
-        ["KINN (Base 2)", "GNN + Scattering", "Yes", 98.20],
-        ["CRMC-Net (Base 1)", "Ghost-CVNN", "No", 99.40],
-        ["PhysX-MKS-GhostNet (Ours)", "PhysX-Ghost", "Yes", our_acc]
+        ["ResNet18", 47.8, 1.27, "-"],
+        ["VGG16", 138.4, 1.42, "-"],
+        ["RMC-Net", 14.6, 0.22, "-"],
+        ["CRMC-Net", 25.8, 1.31, "45.0"],
+        ["PhysX-MKS-Ghost (Ours)", f"{params_mb:.2f}", f"{flops_g:.2f}", f"{lat:.2f}"]
     ]
-    
-    df = pd.DataFrame(data, columns=["Method", "Backbone", "Physics-Informed", "Accuracy (%)"])
-    df.to_csv(f"{RESULTS_DIR}/Table_III_SoC_Comparison.csv", index=False)
-
-def generate_table_ix_reconstruction(model):
-    """ Table IX: Reconstruction Quality """
-    print("Generating Table IX...")
-    
-    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=True)
-    loader = DataLoader(ds, batch_size=32, shuffle=False)
-    
-    model.eval()
-    psnr_total = 0
-    count = 0
-    
-    with torch.no_grad():
-        for img, _ in tqdm(loader, desc="Calc PSNR"):
-            img = img.to(DEVICE)
-            _, recon, _, _ = model(img)
-            
-            # Resize recon if necessary
-            if recon.shape != img.shape:
-                recon = torch.nn.functional.interpolate(recon.real, size=img.shape[2:]) + \
-                        1j * torch.nn.functional.interpolate(recon.imag, size=img.shape[2:])
-            
-            psnr_total += calculate_psnr(img, recon)
-            count += 1
-            
-    avg_psnr = psnr_total / count if count > 0 else 0
-    
-    data = [["PhysX-MKS-GhostNet", f"{avg_psnr:.2f} dB"]]
-    df = pd.DataFrame(data, columns=["Method", "Reconstruction PSNR"])
-    df.to_csv(f"{RESULTS_DIR}/Table_IX_Reconstruction.csv", index=False)
+    df = pd.DataFrame(data, columns=["Model", "Params (MB)", "FLOPs (G)", "Latency (ms)"])
+    save_table(df, "Table_XI_Efficiency")
 
 def main():
     os.makedirs(TABLES_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     
-    # Load Model
+    print(f"Loading model from {CHECKPOINT}")
+    model = PhysX_MKS_GhostNet(num_classes=10, width_mult=0.70, use_vlm=False, tiny=True).to(DEVICE)
     if os.path.exists(CHECKPOINT):
-        print(f"Loading model from {CHECKPOINT}")
-        model = PhysX_MKS_GhostNet(num_classes=10, width_mult=1.4).to(DEVICE)
         model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
     else:
-        print("WARNING: No checkpoint found. Tables will be generated with random weights.")
-        model = PhysX_MKS_GhostNet(num_classes=10, width_mult=1.4).to(DEVICE)
+        print("WARNING: No checkpoint found. Using random weights.")
 
-    # Generate All
+    # Generate All Tables (1-11)
     generate_table_i_network_config(model)
     if os.path.exists("data/MSTAR_Combined"):
-        generate_table_ii_dataset_config()
-    generate_table_iii_soc_comparison()
-    generate_table_v_efficiency(model)
-    
-    if os.path.exists("data/MSTAR_Combined"):
-        generate_table_ix_reconstruction(model)
-    
-    print("\n--- All Tables Generated in outputs/tables/ and outputs/results/ ---")
+        generate_table_iii_soc10_config()  # NEW
+        generate_table_iv_soc3_config()    # NEW
+        generate_table_v_eoc_config()      # NEW
+        generate_table_vi_soc10_results(model)
+        generate_table_vii_soc3_results(model) # NEW
+        generate_table_viii_eoc_results(model)
+        
+    generate_table_xi_efficiency(model)
+
+    print("\n--- All Tables Generated in outputs/tables/ ---")
 
 if __name__ == "__main__":
     main()

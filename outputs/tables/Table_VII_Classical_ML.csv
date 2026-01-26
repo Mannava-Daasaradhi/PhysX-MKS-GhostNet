@@ -1,5 +1,0 @@
-Classifier (on Deep Features),Accuracy (%)
-SVM (RBF),99.31
-Random Forest,99.50
-AdaBoost,10.92
-PhysX-MKS-GhostNet (End-to-End),99.85

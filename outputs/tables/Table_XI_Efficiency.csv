@@ -1,0 +1,6 @@
+Model,Params (MB),FLOPs (G),Latency (ms)
+ResNet18,47.8,1.27,-
+VGG16,138.4,1.42,-
+RMC-Net,14.6,0.22,-
+CRMC-Net,25.8,1.31,45.0
+PhysX-MKS-Ghost (Ours),2.39,4.21,9.07

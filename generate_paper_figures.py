@@ -4,40 +4,59 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import numpy as np
+import cv2
 import os
 from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix
 from math import pi
+from tqdm import tqdm
+from torch.utils.data import DataLoader
 
 from src.models.net_architecture import PhysX_MKS_GhostNet
-from src.dataset import MSTAR_Dataset
+from src.dataset import MSTAR_Dataset, MSTAR_CLASSES
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CHECKPOINT = "outputs/checkpoints/best_model.pth"
 RESULTS_DIR = "outputs/results"
 VIS_DIR = "outputs/visualizations"
-MSTAR_CLASSES = ['2S1', 'BMP2', 'BRDM2', 'BTR60', 'BTR70', 'D7', 'T62', 'T72', 'ZIL131', 'ZSU234']
 
 def load_model():
-    # Ensure width_mult matches your trained model
-    model = PhysX_MKS_GhostNet(num_classes=10, width_mult=1.4).to(DEVICE)
+    # Using 0.7 to match your checkpoint size (17 channels vs 34)
+    print(f"Loading model with width_mult=0.7 from {CHECKPOINT}...")
+    model = PhysX_MKS_GhostNet(num_classes=10, width_mult=0.7).to(DEVICE)
     if os.path.exists(CHECKPOINT):
         model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
-        print(f"Loaded weights from {CHECKPOINT}")
+        print(f"✅ Weights loaded successfully.")
     else:
-        print("WARNING: No checkpoint found. Using random weights.")
+        print("⚠️ WARNING: No checkpoint found. Using random weights.")
     return model
 
 def norm(x):
     """Robust Min-Max Normalization to [0, 1]"""
     return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
+def save_heatmap_overlay(img, mask, filename, title):
+    img_uint8 = (img * 255).astype(np.uint8)
+    mask_uint8 = (mask * 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(mask_uint8, cv2.COLORMAP_JET)
+    img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_GRAY2BGR)
+    overlay = cv2.addWeighted(img_bgr, 0.6, heatmap, 0.4, 0)
+    
+    plt.figure(figsize=(6, 6))
+    plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+    plt.title(title)
+    plt.axis('off')
+    plt.savefig(filename, bbox_inches='tight', dpi=300)
+    plt.close()
+
 def plot_training_curves():
     """ Fig 3: Training Dynamics """
     print("Generating Fig 3: Training Curves...")
     csv_path = f"{RESULTS_DIR}/training_curves.csv"
-    if not os.path.exists(csv_path): return
+    if not os.path.exists(csv_path): 
+        print("  Skipping (No CSV found)")
+        return
 
     df = pd.read_csv(csv_path)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -56,39 +75,8 @@ def plot_training_curves():
     plt.savefig(f"{VIS_DIR}/Fig3_Training_Curves.png", dpi=300)
     plt.close()
 
-def plot_fig2_input_comparison():
-    """ Fig 2: Input Modality Comparison """
-    print("Generating Fig 2: Input Modality Comparison...")
-    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=False)
-    if len(ds) == 0: return
-
-    img, _ = ds[0]
-    complex_np = img.squeeze().numpy()
-    
-    mag = np.abs(complex_np)
-    real = complex_np.real
-    imag = complex_np.imag
-    
-    plt.figure(figsize=(12, 3))
-    
-    plt.subplot(1, 4, 1)
-    plt.text(0.5, 0.5, "Optical\n(N/A)", ha='center', va='center')
-    plt.axis('off'); plt.title("Optical")
-    
-    plt.subplot(1, 4, 2); plt.imshow(norm(mag), cmap='gray'); plt.axis('off'); plt.title("SAR Magnitude")
-    plt.subplot(1, 4, 3); plt.imshow(norm(real), cmap='viridis'); plt.axis('off'); plt.title("Real Part")
-    plt.subplot(1, 4, 4); plt.imshow(norm(imag), cmap='viridis'); plt.axis('off'); plt.title("Imaginary Part")
-    
-    plt.tight_layout()
-    plt.savefig(f"{VIS_DIR}/Fig2_Input_Comparison.png", dpi=300)
-    plt.close()
-
 def plot_confusion_matrices():
-    """ 
-    Fig 4: Confusion Matrices.
-    Strictly Row-Normalized (Recall). 
-    Rows WILL sum to 1.0 (approx). Columns may NOT.
-    """
+    """ Fig 4: Confusion Matrices (Recall Normalized) """
     print("Generating Fig 4: Confusion Matrices...")
     splits = ['soc_test', 'eoc_1_test', 'eoc_2_test']
     
@@ -104,159 +92,140 @@ def plot_confusion_matrices():
 
         cm = confusion_matrix(labels, preds, labels=np.arange(len(MSTAR_CLASSES)))
         
-        # --- Normalization Logic (Column/Precision) ---
-        # Calculate sum of predictions for each class (Columns)
-        col_sums = cm.sum(axis=0)
-        
-        # Avoid division by zero (if a class was never predicted)
-        col_sums[col_sums == 0] = 1 
-        
-        # Normalize
-        cm_norm = cm.astype('float') / col_sums[np.newaxis, :]
-        
-        # Validation Print
-        print(f"  [{split}] Max Row Sum: {cm_norm.sum(axis=1).max():.4f} (Should be 1.0)")
+        # Normalize by Row (Recall)
+        row_sums = cm.sum(axis=1)
+        row_sums[row_sums == 0] = 1 
+        cm_norm = cm.astype('float') / row_sums[:, np.newaxis]
         
         plt.figure(figsize=(10, 8))
         sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues', 
                     xticklabels=MSTAR_CLASSES, yticklabels=MSTAR_CLASSES,
-                    vmin=0.0, vmax=1.0) # Force 0-1 scale
+                    vmin=0.0, vmax=1.0)
         
         plt.title(f'Confusion Matrix (Recall) - {split.upper()}')
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
-        
         plt.tight_layout()
         plt.savefig(f"{VIS_DIR}/Fig4_CM_{split}.png", dpi=300)
         plt.close()
 
-def plot_fig5_gradcam(model):
-    """ Fig 5: PhysX Heatmap """
+def generate_complex_gradcam(model, img_tensor, target_class):
+    model.eval()
+    gradients = []
+    activations = []
+    
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0])
+        
+    def forward_hook(module, input, output):
+        activations.append(output)
+        
+    # Hook into SimAM or last block
+    handle_f = model.simam.register_forward_hook(forward_hook)
+    handle_b = model.simam.register_full_backward_hook(backward_hook)
+    
+    logits, _, _, _ = model(img_tensor.unsqueeze(0))
+    
+    model.zero_grad()
+    score = logits[0, target_class]
+    score.backward()
+    
+    if len(gradients) > 0:
+        grads = gradients[0].abs()
+        acts = activations[0].abs()
+        weights = torch.mean(grads, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * acts, dim=1).squeeze()
+        cam = F.relu(cam)
+        cam = cam.detach().cpu().numpy()
+        cam = cv2.resize(cam, (128, 128))
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+    else:
+        cam = np.zeros((128, 128))
+
+    handle_f.remove()
+    handle_b.remove()
+    return cam
+
+def plot_fig5_gradcam(model, img, label_idx, label_name):
+    """ Fig 5: Grad-CAM """
     print("Generating Fig 5: Grad-CAM...")
-    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=False)
-    if len(ds) == 0: return
-    
-    img, _ = ds[0]
-    img = img.unsqueeze(0).to(DEVICE)
-    
-    model.eval()
+    heatmap = generate_complex_gradcam(model, img, label_idx)
+    img_mag = norm(img.abs().cpu().squeeze().numpy())
+    save_heatmap_overlay(img_mag, heatmap, f"{VIS_DIR}/Fig5_GradCAM.png", f"Grad-CAM: {label_name}")
+
+def plot_fig6_knowledge_points(model, img, label_name):
+    """ Fig 6: Physics Map """
+    print("Generating Fig 6: Physics Map...")
     with torch.no_grad():
-        _, _, scatter, _ = model(img)
-        # Upsample
-        scatter = F.interpolate(scatter, size=(128, 128), mode='bilinear', align_corners=False)
+        _, _, scatter, _ = model(img.unsqueeze(0))
     
-    input_img = norm(img.abs().cpu().squeeze().numpy())
-    att_map = norm(scatter.cpu().squeeze().numpy())
+    scatter_map = scatter.squeeze().detach().cpu().numpy()
+    scatter_map = cv2.resize(scatter_map, (128, 128), interpolation=cv2.INTER_NEAREST)
+    scatter_map = norm(scatter_map)
     
-    plt.figure(figsize=(8, 6))
-    plt.subplot(1, 2, 1); plt.imshow(input_img, cmap='gray'); plt.axis('off'); plt.title("Input")
-    plt.subplot(1, 2, 2); plt.imshow(input_img, cmap='gray'); plt.imshow(att_map, cmap='jet', alpha=0.6); plt.axis('off'); plt.title("Attention")
-    plt.savefig(f"{VIS_DIR}/Fig5_GradCAM.png", dpi=300)
-    plt.close()
+    img_mag = norm(img.abs().cpu().squeeze().numpy())
+    save_heatmap_overlay(img_mag, scatter_map, f"{VIS_DIR}/Fig6_Physics_Map.png", f"Scattering Centers: {label_name}")
 
-def plot_fig6_knowledge_points(model):
-    """
-    Fig 6: Knowledge Points (Red=Target, Green=Shadow, Blue=BG).
-    FIX: Adjusted thresholds to force Green visibility.
-    """
-    print("Generating Fig 6: Knowledge Points...")
-    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=False)
-    if len(ds) == 0: return
-
-    # Loop to find a sample with decent contrast
-    for i in range(min(10, len(ds))):
-        img, _ = ds[i]
-        mag_check = img.abs().mean().item()
-        if mag_check > 0.01: # Skip completely empty images
-            idx = i
-            break
-    
-    img = img.unsqueeze(0).to(DEVICE)
-    
-    model.eval()
-    with torch.no_grad():
-        _, _, scatter, _ = model(img)
-        scatter = F.interpolate(scatter, size=(128, 128), mode='bilinear', align_corners=False)
-    
-    mag = norm(img.abs().cpu().squeeze().numpy())
-    phys = norm(scatter.cpu().squeeze().numpy())
-    
-    # --- New Threshold Logic ---
-    # 1. Target (Red): Physics response is high
-    mask_target = phys > 0.6
-    
-    # 2. Shadow (Green): Magnitude is LOW (Dark) but NOT background noise
-    # We define shadow as pixels between 0.05 and 0.3 intensity
-    # (Assuming 0.0-0.05 is pure background noise)
-    mask_shadow = (mag < 0.3) & (mag > 0.05) & (~mask_target)
-    
-    # 3. Background (Blue): Everything else
-    mask_bg = (~mask_target) & (~mask_shadow)
-    
-    # Build Overlay
-    h, w = mag.shape
-    overlay = np.zeros((h, w, 3))
-    overlay[mask_target] = [1, 0, 0] # Red
-    overlay[mask_shadow] = [0, 1, 0] # Green
-    overlay[mask_bg]     = [0, 0, 1] # Blue
-    
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1); plt.imshow(mag, cmap='gray'); plt.axis('off'); plt.title("Input SAR")
-    plt.subplot(1, 2, 2); plt.imshow(mag, cmap='gray'); plt.imshow(overlay, alpha=0.5); plt.axis('off'); plt.title("Knowledge Points")
-    
-    plt.savefig(f"{VIS_DIR}/Fig6_Physics_Map.png", dpi=300)
-    plt.close()
-
-def plot_fig7_reconstruction(model):
+def plot_fig7_reconstruction(model, img):
     """ Fig 7: Reconstruction """
     print("Generating Fig 7: Reconstruction...")
-    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=False)
-    if len(ds) == 0: return
-    
-    img, _ = ds[0]
-    img = img.unsqueeze(0).to(DEVICE)
-    
-    model.eval()
     with torch.no_grad():
-        _, recon, _, _ = model(img)
+        _, recon, _, _ = model(img.unsqueeze(0))
         
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1); plt.imshow(norm(img.abs().cpu().squeeze().numpy()), cmap='gray'); plt.axis('off'); plt.title("Noisy")
-    plt.subplot(1, 2, 2); plt.imshow(norm(recon.abs().cpu().squeeze().numpy()), cmap='gray'); plt.axis('off'); plt.title("Recon")
-    plt.savefig(f"{VIS_DIR}/Fig7_Reconstruction.png", dpi=300)
+    img_mag = norm(img.abs().cpu().squeeze().numpy())
+    recon_mag = norm(recon.abs().cpu().squeeze().numpy())
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+    ax[0].imshow(img_mag, cmap='gray'); ax[0].set_title("Input (Noisy)")
+    ax[0].axis('off')
+    ax[1].imshow(recon_mag, cmap='gray'); ax[1].set_title("Reconstruction (Cleaned)")
+    ax[1].axis('off')
+    plt.savefig(f"{VIS_DIR}/Fig7_Reconstruction.png", bbox_inches='tight')
     plt.close()
 
 def plot_fig8_tsne(model):
-    """ Fig 8: t-SNE """
+    """ Fig 8: t-SNE (Robust) """
     print("Generating Fig 8: t-SNE...")
-    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=False)
-    if len(ds) == 0: return
-
-    indices = np.random.choice(len(ds), min(500, len(ds)), replace=False)
-    features, labels = [], []
+    ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=True)
+    loader = DataLoader(ds, batch_size=32, shuffle=True)
+    
+    features = []
+    labels = []
     
     model.eval()
     with torch.no_grad():
-        for i in indices:
-            img, lbl = ds[i]
-            img = img.unsqueeze(0).to(DEVICE)
-            _, _, _, vlm = model(img)
-            features.append(vlm.cpu().numpy().flatten())
-            labels.append(lbl)
+        for img, label in tqdm(loader, desc="Extracting Features"):
+            img = img.to(DEVICE)
+            logits, _, _, vlm = model(img)
             
+            # --- FIX: Fallback if VLM is None ---
+            if vlm is not None:
+                feat = vlm.cpu().numpy()
+            else:
+                # Use logits as fallback features
+                feat = logits.cpu().numpy()
+                
+            features.append(feat.reshape(img.size(0), -1))
+            labels.extend(label.numpy())
+            
+            if len(labels) > 600: break # Limit for speed
+            
+    X = np.concatenate(features, axis=0)
+    y = np.array(labels)
+    
     tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-    X_emb = tsne.fit_transform(np.array(features))
+    X_emb = tsne.fit_transform(X)
     
     plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(X_emb[:, 0], X_emb[:, 1], c=labels, cmap='tab10', alpha=0.7)
+    scatter = plt.scatter(X_emb[:, 0], X_emb[:, 1], c=y, cmap='tab10', alpha=0.7)
     plt.legend(handles=scatter.legend_elements()[0], labels=MSTAR_CLASSES)
-    plt.title("Feature t-SNE"); plt.grid(True, alpha=0.3)
+    plt.title("t-SNE Feature Projection")
     plt.savefig(f"{VIS_DIR}/Fig8_tSNE.png", dpi=300)
     plt.close()
 
 def plot_fig9_radar():
-    """ Fig 9: Radar """
-    print("Generating Fig 9: Radar...")
+    """ Fig 9: Radar Chart """
+    print("Generating Fig 9: Radar Chart...")
     cats = ['Accuracy', 'Efficiency', 'Robustness', 'Trust', 'Reconstruction']
     vals_ours = [0.99, 0.95, 0.92, 1.0, 0.90]; vals_ours += vals_ours[:1]
     vals_base = [0.98, 0.60, 0.85, 0.4, 0.10]; vals_base += vals_base[:1]
@@ -269,44 +238,36 @@ def plot_fig9_radar():
     ax.fill(angles, vals_ours, 'b', alpha=0.1)
     ax.plot(angles, vals_base, 'r--', linewidth=2, label="Baseline")
     ax.fill(angles, vals_base, 'r', alpha=0.1)
-    plt.legend(); plt.title("Capability Profile")
+    plt.legend(loc='upper right')
+    plt.title("Capability Profile")
     plt.savefig(f"{VIS_DIR}/Fig9_Radar.png", dpi=300)
-    plt.close()
-
-def plot_fig10_robustness():
-    """ Fig 10: Robustness """
-    print("Generating Fig 10: Robustness...")
-    csv_path = f"{RESULTS_DIR}/noise_robustness.csv"
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path)
-        nl, acc_o, acc_b = df['Noise_Level'], df['Ours_Acc'], df['Baseline_Acc']
-    else:
-        nl = [0, 0.1, 0.2, 0.3, 0.4, 0.5]
-        acc_o = [99.5, 98.0, 95.5, 92.0, 88.0, 85.0]
-        acc_b = [99.0, 95.0, 88.0, 75.0, 60.0, 50.0]
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(nl, acc_o, 'bo-', label='Ours')
-    plt.plot(nl, acc_b, 'rs--', label='Baseline')
-    plt.xlabel("Noise"); plt.ylabel("Accuracy"); plt.legend(); plt.grid(True)
-    plt.savefig(f"{VIS_DIR}/Fig10_Label_Noise_Robustness.png", dpi=300)
     plt.close()
 
 def main():
     os.makedirs(VIS_DIR, exist_ok=True)
     model = load_model()
+    model.eval()
     
+    # 1. Training & Metrics
     plot_training_curves()
     plot_confusion_matrices()
+    
+    # 2. Visualizations
     if os.path.exists("data/MSTAR_Combined"):
-        plot_fig2_input_comparison()
-        plot_fig5_gradcam(model)
-        plot_fig6_knowledge_points(model)
-        plot_fig7_reconstruction(model)
+        ds = MSTAR_Dataset(root_dir="data/MSTAR_Combined", split='soc_test', cache_memory=True)
+        # Pick a sample (e.g., T72 or BMP2)
+        idx = 100 
+        img, label_idx = ds[idx]
+        img = img.to(DEVICE)
+        label_name = MSTAR_CLASSES[label_idx]
+        
+        plot_fig5_gradcam(model, img, label_idx, label_name)
+        plot_fig6_knowledge_points(model, img, label_name)
+        plot_fig7_reconstruction(model, img)
         plot_fig8_tsne(model)
+        
     plot_fig9_radar()
-    plot_fig10_robustness()
-    print(f"\n--- Complete. Check {VIS_DIR} ---")
+    print(f"\n✅ All Figures Generated in {VIS_DIR}/")
 
 if __name__ == "__main__":
     main()
