@@ -1,0 +1,5 @@
+Dataset Split,Description,Image Count
+SOC_TRAIN,Standard,3678
+SOC_TEST,Standard,3211
+EOC_1_TEST,Robustness Test,2272
+EOC_2_TEST,Robustness Test,3129

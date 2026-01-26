@@ -183,4 +183,4 @@ class MSTAR_Dataset(Dataset):
         if self.transform:
             img = self.transform(img)
             
-        return img, labelnext
+        return img, label
