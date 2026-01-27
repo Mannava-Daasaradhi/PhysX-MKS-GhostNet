@@ -1,11 +1,10 @@
 import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
 import os
-import sys
 
 def main():
     # --- CONFIG ---
-    # The path relative to where you run the script (project root)
+    # Corrected paths relative to project root
     input_model_path = "outputs/physx_ghost.onnx"
     output_model_path = "outputs/physx_ghost_int8.onnx"
 
@@ -16,7 +15,7 @@ def main():
     # 1. Verify Input Exists
     if not os.path.exists(input_model_path):
         print(f"\n❌ ERROR: File not found: {input_model_path}")
-        print(f"   Did you run export_to_onnx.py? Check if the 'outputs' folder exists.")
+        print(f"   Please check if the 'outputs' folder exists.")
         return
 
     # 2. Run Quantization
@@ -28,7 +27,6 @@ def main():
         )
         print(f"\n✅ SUCCESS: Quantization complete!")
         print(f"   Saved to: {output_model_path}")
-        print("   You can now transfer this INT8 model to your Raspberry Pi.")
         
     except Exception as e:
         print(f"\n❌ FAILED: {e}")
