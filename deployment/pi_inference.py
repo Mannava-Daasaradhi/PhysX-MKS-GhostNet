@@ -1,67 +1,58 @@
 import numpy as np
 import onnxruntime as ort
 import time
-import argparse
 import os
+import argparse
 
-def main():
-    parser = argparse.ArgumentParser()
-    # Default to the Float32 model (it was faster)
-    parser.add_argument('--model', type=str, default='outputs/physx_ghost.onnx', help='Path to ONNX model')
-    args = parser.parse_args()
-
-    if not os.path.exists(args.model):
-        print(f"Error: Model {args.model} not found.")
-        return
-
-    # --- PERFORMANCE TUNING ---
+def benchmark_config(model_path, threads, mode_name):
     sess_options = ort.SessionOptions()
-    # Raspberry Pi 4 has 4 physical cores. Setting this to 4 usually gives max speed.
-    sess_options.intra_op_num_threads = 4
-    # Enable all internal optimizations (Constant Folding, etc.)
+    sess_options.intra_op_num_threads = threads
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # Sequential execution is often faster for small batches
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-    # Initialize Session
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
     try:
-        sess = ort.InferenceSession(args.model, sess_options=sess_options, providers=providers)
-    except:
-        sess = ort.InferenceSession(args.model, sess_options=sess_options, providers=['CPUExecutionProvider'])
+        sess = ort.InferenceSession(model_path, sess_options=sess_options, providers=['CPUExecutionProvider'])
+    except Exception as e:
+        print(f"Skipping {mode_name}: {e}")
+        return 0
 
-    print(f"--- Running on: {sess.get_providers()[0]} ---")
-    print(f"--- Threads: {sess_options.intra_op_num_threads} ---")
-
-    # Get Input Info
+    # Dummy Input
     input_node = sess.get_inputs()[0]
-    input_name = input_node.name
-    # Force Shape: (Batch, 2, 128, 128) -> [Real, Imag]
     input_shape = (1, 2, 128, 128)
-    
-    # Create Dummy Data
     dummy_input = np.random.randn(*input_shape).astype(np.float32)
 
     # Warmup
-    print("Warming up...")
     for _ in range(20):
-        sess.run(None, {input_name: dummy_input})
+        sess.run(None, {input_node.name: dummy_input})
 
-    # Benchmark
-    print("Benchmarking (200 runs)...")
-    latencies = []
-    
+    # Run
+    start = time.time()
     for _ in range(200):
-        t0 = time.time()
-        sess.run(None, {input_name: dummy_input})
-        latencies.append((time.time() - t0) * 1000) # ms
+        sess.run(None, {input_node.name: dummy_input})
+    end = time.time()
 
-    # Report
-    avg_ms = np.mean(latencies)
-    fps = 1000.0 / avg_ms
-    print(f"\nRESULTS (Float32 Optimized):")
-    print(f"Avg Latency: {avg_ms:.2f} ms")
-    print(f"Throughput:  {fps:.2f} FPS")
+    fps = 200.0 / (end - start)
+    print(f"  [{mode_name}] Threads={threads} :: FPS = {fps:.2f}")
+    return fps
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='outputs/physx_ghost.onnx')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.model):
+        print("Model not found!")
+        return
+
+    print(f"--- Tuning PhysX-MKS-GhostNet on Raspberry Pi 5 ---")
+    print(f"Model: {args.model}")
+    
+    # Run Sweep
+    res_1 = benchmark_config(args.model, 1, "Single-Core")
+    res_2 = benchmark_config(args.model, 2, "Dual-Core  ")
+    res_4 = benchmark_config(args.model, 4, "Quad-Core  ")
+
+    print(f"\n🏆 WINNER: {max(res_1, res_2, res_4):.2f} FPS")
 
 if __name__ == "__main__":
     main()
