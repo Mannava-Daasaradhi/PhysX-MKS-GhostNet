@@ -1,8 +1,8 @@
-torch>=1.12.0
-torchvision>=0.13.0
-numpy
-pandas
-tqdm
-scikit-learn
-matplotlib
-seaborn
+torch==1.12.1
+torchvision==0.13.1
+numpy==1.23.5
+pandas==1.5.3
+tqdm==4.65.0
+scikit-learn==1.2.2
+matplotlib==3.7.1
+seaborn==0.12.2
