@@ -32,7 +32,7 @@ class ComplexSimAM(nn.Module):
 
 class PhysX_MKS_GhostNet(nn.Module):
     """
-    PhysX-MKS-GhostNet (Optimized for <0.3M Params)
+    PhysX-MKS-GhostNet (Optimized for EOC Robustness)
     """
     def __init__(self, num_classes=10, width_mult=0.7, use_vlm=False, tiny=True):
         super(PhysX_MKS_GhostNet, self).__init__()
@@ -40,7 +40,6 @@ class PhysX_MKS_GhostNet(nn.Module):
         
         # --- CONFIGURATION FOR TINY MODE (<0.3M) ---
         # Optimized for strict <0.3M target while maintaining 99% acc potential.
-        # Reduced head_c to 96 (was 128) and cmks_c to 10 (was 12).
         cmks_c = 10 if tiny else 16
         head_c = 96 if tiny else 256
         
@@ -98,6 +97,11 @@ class PhysX_MKS_GhostNet(nn.Module):
         self.physics_branch = PhysicsMapping(in_channels=final_channels)
         self.decoder = ReconstructionDecoder(in_channels=final_channels)
         
+        # [NEW] Learnable Physics Gate
+        # Allows the model to scale the impact of the physics branch. 
+        # Initialized to 0.1 to allow gradual integration during training.
+        self.phys_gate = nn.Parameter(torch.tensor(0.1))
+        
         # --- Module F: VLM Projector (Optional) ---
         if self.use_vlm:
             self.vlm_projector = ComplexConv2d(final_channels, 768, 1, 1, 0)
@@ -105,7 +109,8 @@ class PhysX_MKS_GhostNet(nn.Module):
         # --- Classifier ---
         self.conv_last = ComplexConv2d(final_channels, head_c, 1, 1, 0)
         
-        # Final Linear Layer
+        # [NEW] Dropout for EOC Generalization
+        self.dropout = nn.Dropout(p=0.3)
         self.classifier = nn.Linear(head_c * 2, num_classes)
 
     def forward(self, x):
@@ -123,8 +128,9 @@ class PhysX_MKS_GhostNet(nn.Module):
         recon_img = self.decoder(features_att) 
         scatter_map = self.physics_branch(features_att) 
         
-        # --- INJECT PHYSICS INTO CLASSIFIER ---
-        features_phys = features_att * (1 + scatter_map)
+        # [IMPROVED] Gated Physics Injection
+        # Uses learnable gate instead of hard addition: features * (1 + gate * scatter)
+        features_phys = features_att * (1 + self.phys_gate * scatter_map)
         
         # 4. Vision-Language Projection (Optional)
         vlm_out = None
@@ -140,6 +146,10 @@ class PhysX_MKS_GhostNet(nn.Module):
         
         # Concatenate Real and Imag parts for the final Linear Layer
         x_real_features = torch.cat([x_flat.real, x_flat.imag], dim=1)
+        
+        # [IMPROVED] Apply Dropout
+        x_real_features = self.dropout(x_real_features)
+        
         class_logits = self.classifier(x_real_features)
         
         return class_logits, recon_img, scatter_map, vlm_out
