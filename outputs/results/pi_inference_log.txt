@@ -1,0 +1,10 @@
+
+--- GENERATING PAPER FIGURES (REAL DATA) ---
+Loading training data: 100 epochs found.
+✅ Generated Fig 3 (Training Curves)
+✅ Generated Fig 4 (SOC_10 CM - Acc: 98.44%)
+✅ Generated Fig 4 (EOC CM - Acc: 83.52%)
+❌ Error in Qualitative Viz: Image data of dtype complex64 cannot be converted to float
+✅ Generated Fig 6 (Ablation Study)
+
+✅ All figures saved to: /home/mannava/Desktop/PhysX-MKS-GhostNet_V2/outputs/visualizations
