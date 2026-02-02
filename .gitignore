@@ -11,3 +11,4 @@ outputs/checkpoints/
 # System
 .DS_Store
 Thumbs.db
+env/
