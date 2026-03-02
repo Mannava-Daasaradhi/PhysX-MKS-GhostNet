@@ -169,10 +169,6 @@ Target classes are defined in `src/dataset.py` as `MSTAR_CLASSES`.
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## 📄 License
-
-[Add your license here]
-
 ## 📧 Contact
 
 Mannava Daasaradhi - [@Mannava-Daasaradhi](https://github.com/Mannava-Daasaradhi)
